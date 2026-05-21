@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LAMF MoEngage Encryption Key Generator</title>
+  <style>
+    body{font-family:Arial,sans-serif;background:#f5f8f7;margin:0;color:#1f2937}.wrap{max-width:900px;margin:40px auto;padding:24px}.card{background:#fff;border-radius:18px;padding:24px;box-shadow:0 8px 30px rgba(0,0,0,.08)}h1{color:#07877B;margin:0 0 8px}.muted{color:#6b7280;line-height:1.5}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:18px 0}.field{display:flex;flex-direction:column;gap:8px}label{font-weight:700}input,textarea{border:1px solid #d1d5db;border-radius:10px;padding:12px;font-size:14px}button{background:#07877B;color:white;border:0;border-radius:12px;padding:13px 18px;font-size:15px;font-weight:700;cursor:pointer}button.secondary{background:#374151}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}.note{background:#ecfdf5;border-left:4px solid #07877B;padding:14px;border-radius:8px;margin:16px 0}.warn{background:#fff7ed;border-left:4px solid #f97316;padding:14px;border-radius:8px;margin:16px 0}table{width:100%;border-collapse:collapse;margin-top:18px;font-size:13px}th,td{border-bottom:1px solid #e5e7eb;text-align:left;padding:10px;vertical-align:top}th{background:#f9fafb}.hidden{display:none}code{background:#f3f4f6;padding:2px 5px;border-radius:5px}.small{font-size:12px;color:#6b7280}@media(max-width:700px){.row{grid-template-columns:1fr}.wrap{margin:10px auto;padding:12px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>LAMF Encryption Key Generator</h1>
+    <p class="muted">Upload a CSV with <b>CID</b>, <b>Name</b>, and <b>Eligible Amount</b>. This app will generate an encrypted key field that can be uploaded to MoEngage and passed in the landing page URL.</p>
+
+    <div class="warn"><b>Important:</b> This browser-only encryption is suitable for POC/UAT. For production, use backend token lookup because frontend decryption keys can be viewed by technical users.</div>
+
+    <div class="row">
+      <div class="field">
+        <label>Encryption Secret</label>
+        <input id="secret" type="password" placeholder="Enter shared secret key" value="LAMF_POC_SECRET_2026" />
+        <div class="small">Use the same secret in the landing page decrypt code.</div>
+      </div>
+      <div class="field">
+        <label>Upload CSV</label>
+        <input id="csvFile" type="file" accept=".csv" />
+        <div class="small">Required headers: CID, Name, Eligible Amount</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button onclick="downloadSample()">Download Sample CSV</button>
+      <button onclick="processCSV()">Generate Encrypted CSV</button>
+      <button class="secondary" onclick="downloadOutput()" id="downloadBtn" disabled>Download Output CSV</button>
+    </div>
+
+    <div class="note">
+      MoEngage URL format example:<br>
+      <code>https://yourdomain.com/lamf/?key={{UserAttribute['lamf_key']}}</code>
+    </div>
+
+    <div id="status" class="muted"></div>
+    <div id="preview"></div>
+  </div>
+</div>
+
+<script>
+let outputRows = [];
+
+function parseCSV(text){
+  const rows=[]; let cur='', row=[], inQuotes=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i], next=text[i+1];
+    if(ch==='"' && inQuotes && next==='"'){cur+='"'; i++;}
+    else if(ch==='"'){inQuotes=!inQuotes;}
+    else if(ch===',' && !inQuotes){row.push(cur); cur='';}
+    else if((ch==='\n'||ch==='\r') && !inQuotes){
+      if(cur!=='' || row.length){row.push(cur); rows.push(row); row=[]; cur='';}
+      if(ch==='\r' && next==='\n') i++;
+    } else cur+=ch;
+  }
+  if(cur!=='' || row.length){row.push(cur); rows.push(row);}
+  return rows;
+}
+
+function csvEscape(v){
+  v = String(v ?? '');
+  return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
+}
+
+function toCSV(rows){
+  return rows.map(r=>r.map(csvEscape).join(',')).join('\n');
+}
+
+function base64UrlEncode(bytes){
+  let str=''; bytes.forEach(b=>str+=String.fromCharCode(b));
+  return btoa(str).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+function base64UrlDecode(str){
+  str = str.replace(/-/g,'+').replace(/_/g,'/');
+  while(str.length % 4) str += '=';
+  const bin = atob(str);
+  return Uint8Array.from(bin, c=>c.charCodeAt(0));
+}
+
+async function getKey(secret, salt){
+  const enc = new TextEncoder();
+  const material = await crypto.subtle.importKey('raw', enc.encode(secret), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:100000, hash:'SHA-256'}, material, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+
+async function encryptPayload(payload, secret){
+  const enc = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await getKey(secret, salt);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, enc.encode(JSON.stringify(payload))));
+  const packed = new Uint8Array(16 + 12 + cipher.length);
+  packed.set(salt,0); packed.set(iv,16); packed.set(cipher,28);
+  return base64UrlEncode(packed);
+}
+
+async function decryptLamfKey(encryptedKey, secret){
+  const packed = base64UrlDecode(encryptedKey);
+  const salt = packed.slice(0,16);
+  const iv = packed.slice(16,28);
+  const cipher = packed.slice(28);
+  const key = await getKey(secret, salt);
+  const plain = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, cipher);
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+async function processCSV(){
+  const file = document.getElementById('csvFile').files[0];
+  const secret = document.getElementById('secret').value.trim();
+  const status = document.getElementById('status');
+  if(!file){status.textContent='Please upload a CSV file.';return;}
+  if(!secret){status.textContent='Please enter an encryption secret.';return;}
+  const text = await file.text();
+  const rows = parseCSV(text).filter(r=>r.some(c=>String(c).trim()!==''));
+  if(rows.length < 2){status.textContent='CSV has no data rows.';return;}
+  const headers = rows[0].map(h=>h.trim().toLowerCase());
+  const cidIdx = headers.findIndex(h=>['cid','client id','clientid'].includes(h));
+  const nameIdx = headers.findIndex(h=>['name','client name','clientname'].includes(h));
+  const amtIdx = headers.findIndex(h=>['eligible amount','eligibleamount','amount'].includes(h));
+  if(cidIdx<0 || nameIdx<0 || amtIdx<0){status.textContent='Required headers missing. Use CID, Name, Eligible Amount.';return;}
+
+  outputRows = [[...rows[0], 'lamf_key']];
+  for(let i=1;i<rows.length;i++){
+    const r = rows[i];
+    const payload = { cid: r[cidIdx] || '', name: r[nameIdx] || '', eligibleAmount: r[amtIdx] || '' };
+    const encrypted = await encryptPayload(payload, secret);
+    outputRows.push([...r, encrypted]);
+  }
+  document.getElementById('downloadBtn').disabled=false;
+  status.textContent = `Generated encrypted keys for ${outputRows.length-1} records.`;
+  renderPreview(outputRows.slice(0,6));
+}
+
+function renderPreview(rows){
+  let html='<table><thead><tr>'+rows[0].map(h=>`<th>${h}</th>`).join('')+'</tr></thead><tbody>';
+  rows.slice(1).forEach(r=>{html+='<tr>'+r.map(c=>`<td>${String(c).slice(0,70)}${String(c).length>70?'...':''}</td>`).join('')+'</tr>';});
+  html+='</tbody></table>';
+  document.getElementById('preview').innerHTML=html;
+}
+
+function downloadOutput(){
+  if(!outputRows.length) return;
+  const blob = new Blob([toCSV(outputRows)], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'lamf_moengage_upload_with_key.csv';
+  a.click();
+}
+
+function downloadSample(){
+  const sample = [
+    ['CID','Name','Eligible Amount'],
+    ['1070154','Sajan Jose','250000'],
+    ['1070155','Anita Kumar','175000']
+  ];
+  const blob = new Blob([toCSV(sample)], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'lamf_sample_input.csv';
+  a.click();
+}
+</script>
+</body>
+</html>
